@@ -8,6 +8,7 @@ This software places REAL orders with REAL money.
 Test in paper trading mode first. Never risk more than you can afford to lose.
 The authors are not responsible for trading losses.
 
+It is a fully automatic algo trading setup that fires entry and exit signals as per your strategy and configurations setup in the project. Just upload your strategy logic and the project will handle automatic authentication, signal generation, market entry, slippage etc. I have used a strategy involving Kalman filters for my trading setup.
 ---
 
 ## File Structure
