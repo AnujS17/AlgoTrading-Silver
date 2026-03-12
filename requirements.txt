@@ -1,0 +1,12 @@
+# requirements.txt
+# Install with: pip install -r requirements.txt
+
+requests>=2.31.0
+websocket-client>=1.7.0
+flask>=3.0.0
+pandas>=2.0.0
+numpy>=1.26.0
+
+# Upstox official SDK — REQUIRED for v3 WebSocket feed (Tier 1 & Tier 2).
+# Without this the engine falls back to REST polling (~30-60s delay).
+upstox-python-sdk>=2.9.0
