@@ -98,9 +98,12 @@ def _parse_ltt(ltt) -> datetime:
 # Candle Assembler  —  tick -> OHLCV bar
 # ─────────────────────────────────────────────────────────────
 class CandleAssembler:
-    def __init__(self, interval_minutes: int, on_candle_close: Callable):
+    def __init__(self, interval_minutes: int,
+                 on_candle_close: Callable,
+                 on_tick: Optional[Callable] = None):
         self.interval    = interval_minutes
         self.callback    = on_candle_close
+        self._on_tick    = on_tick   # optional per-tick callback (ltp, ts) → None
         self._candle     = None
         self._lock       = threading.Lock()
         self._tick_count = 0
@@ -122,6 +125,11 @@ class CandleAssembler:
             if self._candle is None:
                 self._candle = _new_candle(bar_ts, ltp, volume)
                 logger.info("First tick received  LTP=%.0f  bar=%s", ltp, bar_ts)
+                if self._on_tick:
+                    try:
+                        self._on_tick(ltp, ts)
+                    except Exception as e:
+                        logger.debug("on_tick error: %s", e)
                 return
 
             if bar_ts == self._candle["ts"]:
@@ -130,6 +138,12 @@ class CandleAssembler:
                 c["low"]     = min(c["low"],   ltp)
                 c["close"]   = ltp
                 c["volume"] += volume
+                # fire on_tick every tick while bar is open (intrabar trail monitor)
+                if self._on_tick:
+                    try:
+                        self._on_tick(ltp, ts)
+                    except Exception as e:
+                        logger.debug("on_tick error: %s", e)
             else:
                 done = dict(self._candle)
                 logger.info(
@@ -141,6 +155,12 @@ class CandleAssembler:
                 except Exception as e:
                     logger.error("Strategy callback error: %s", e, exc_info=True)
                 self._candle = _new_candle(bar_ts, ltp, volume)
+                # also fire on_tick for the first tick of the new bar
+                if self._on_tick:
+                    try:
+                        self._on_tick(ltp, ts)
+                    except Exception as e:
+                        logger.debug("on_tick error: %s", e)
 
     def get_current(self) -> Optional[dict]:
         with self._lock:
@@ -487,9 +507,10 @@ class MarketDataStreamerFeed:
         except ImportError:
             return False
 
-    def __init__(self, access_token: str, on_candle_close: Callable):
+    def __init__(self, access_token: str, on_candle_close: Callable,
+                 on_tick: Optional[Callable] = None):
         self.access_token = access_token
-        self.assembler    = CandleAssembler(config.CANDLE_INTERVAL, on_candle_close)
+        self.assembler    = CandleAssembler(config.CANDLE_INTERVAL, on_candle_close, on_tick)
         self._stop        = threading.Event()
         self._streamer    = None
 
@@ -576,9 +597,10 @@ class RawWebSocketFeed:
         except ImportError:
             return False
 
-    def __init__(self, access_token: str, on_candle_close: Callable):
+    def __init__(self, access_token: str, on_candle_close: Callable,
+                 on_tick: Optional[Callable] = None):
         self.access_token = access_token
-        self.assembler    = CandleAssembler(config.CANDLE_INTERVAL, on_candle_close)
+        self.assembler    = CandleAssembler(config.CANDLE_INTERVAL, on_candle_close, on_tick)
         self._ws          = None
         self._stop        = threading.Event()
 
@@ -801,9 +823,11 @@ class UpstoxFeed:
       pip install upstox-python-sdk
     """
 
-    def __init__(self, access_token: str, on_candle_close: Callable):
+    def __init__(self, access_token: str, on_candle_close: Callable,
+                 on_tick: Optional[Callable] = None):
         self.access_token = access_token
         self._callback    = on_candle_close
+        self._on_tick     = on_tick
         self._feed        = None
 
     def start(self):
@@ -811,7 +835,8 @@ class UpstoxFeed:
         if MarketDataStreamerFeed.is_available():
             logger.info("Tier 1 selected: MarketDataStreamer (SDK v3)")
             try:
-                self._feed = MarketDataStreamerFeed(self.access_token, self._callback)
+                self._feed = MarketDataStreamerFeed(self.access_token, self._callback,
+                                                    self._on_tick)
                 self._feed.start()
                 return
             except Exception as e:
@@ -822,17 +847,25 @@ class UpstoxFeed:
             logger.info("Tier 2 selected: RawWebSocket + proto decoder")
             try:
                 _get_authorized_ws_url(self.access_token)   # pre-flight check
-                self._feed = RawWebSocketFeed(self.access_token, self._callback)
+                self._feed = RawWebSocketFeed(self.access_token, self._callback,
+                                              self._on_tick)
                 self._feed.start()
                 return
             except Exception as e:
                 logger.error("Tier 2 failed: %s — falling to Tier 3", e)
 
         # ── Tier 3: REST poller ────────────────────────────────
+        # NOTE: REST feed has no per-tick data — on_tick is not fired in Tier 3.
+        # Intrabar trail exits will NOT be active when running on Tier 3.
         logger.warning(
             "Tier 3 selected: REST 1-min poller. "
             "Install upstox-python-sdk for real-time data."
         )
+        if self._on_tick:
+            logger.warning(
+                "INTRABAR_TRAIL_EXIT is enabled but Tier 3 (REST) has no tick data. "
+                "Trail exits will only fire at bar close while on Tier 3."
+            )
         self._feed = RESTCandleFeed(self.access_token, self._callback)
         self._feed.start()
 

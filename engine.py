@@ -208,6 +208,10 @@ class TradingEngine:
         self._entry_ts   = None
         self._order_id   = None    # last placed order id
 
+        # Intrabar exit guard — prevents double-exit within the same bar.
+        # Reset to False at the top of every on_candle_close().
+        self._intrabar_exit_fired = False
+
         # Heartbeat: track last tick time for rollover/disconnect detection
         self._last_tick_ts: Optional[datetime] = None
         self._TICK_TIMEOUT_MINS = 10   # warn if no tick for this long during session
@@ -248,6 +252,9 @@ class TradingEngine:
         This is the strategy's heartbeat.
         """
         with self._lock:
+            # Reset intrabar exit guard so it can fire again on this new bar
+            self._intrabar_exit_fired = False
+
             ts = candle["ts"]
 
             # Update heartbeat timestamp (Layer 3 rollover guard)
@@ -393,14 +400,37 @@ class TradingEngine:
 
         try:
             tag = f"K_EXIT_{signal.bar_ts.strftime('%H%M')}"
-            if self._pos == 1:
-                order_id = self.broker.exit_long(self._open_qty, tag=tag)
-            else:
-                order_id = self.broker.exit_short(self._open_qty, tag=tag)
 
-            fill_px = self._wait_for_fill(order_id, timeout=10)
+            fill_px  = None
+            order_id = None
 
-            # Calculate P&L
+            # ── Smart Limit Exit (slippage control) ───────────────
+            # Attempt a LIMIT order at current LTP first.
+            # Falls back to MARKET if not filled within LIMIT_ORDER_TIMEOUT_SECS.
+            # Disabled automatically for ATR Trail exits where speed is critical
+            # (intrabar trail hits and fallback trail hits want guaranteed fills).
+            use_smart = (
+                getattr(config, "SMART_LIMIT_EXITS", False) and
+                signal.reason not in ("ATR Trail Intrabar", "ATR Trail Fallback",
+                                      "Session End (ALLOW_OVERNIGHT=False)")
+            )
+
+            if use_smart:
+                fill_px = self._smart_limit_exit(tag)
+                if fill_px is not None:
+                    # Smart limit succeeded — record the order id as unknown
+                    # (already filled and closed; we only need fill_px)
+                    order_id = "SMART_LIMIT"
+
+            # ── MARKET fallback (or primary if smart exits disabled) ──
+            if fill_px is None:
+                if self._pos == 1:
+                    order_id = self.broker.exit_long(self._open_qty, tag=tag)
+                else:
+                    order_id = self.broker.exit_short(self._open_qty, tag=tag)
+                fill_px = self._wait_for_fill(order_id, timeout=10)
+
+            # ── Calculate and record P&L ───────────────────────────
             if self._pos == 1:
                 pnl = (fill_px - self._entry_px) * self._open_qty
             else:
@@ -470,6 +500,181 @@ class TradingEngine:
             logger.error("Trail SL-M update FAILED: %s — manual stop check required", e)
 
     # ─────────────────────────────────────────────────────────
+    # ─────────────────────────────────────────────────────────
+    # Tick-level intrabar trail monitor
+    # ─────────────────────────────────────────────────────────
+    def on_tick(self, ltp: float, ts):
+        """
+        Called on every raw LTP tick by the feed (Tier 1 / Tier 2 only).
+        Only active when config.INTRABAR_TRAIL_EXIT = True.
+
+        Compares LTP against the live ATR trail stop every tick.
+        If breached, fires an immediate exit — does NOT wait for bar close.
+
+        Thread safety: uses _lock + _intrabar_exit_fired flag to ensure
+        only one exit fires per bar, and cannot race with on_candle_close.
+        """
+        if not getattr(config, "INTRABAR_TRAIL_EXIT", False):
+            return
+        if self._pos == 0:
+            return
+
+        trail = self.strategy.current_trail
+        if trail != trail:   # nan check — trail not yet initialised after entry
+            return
+
+        # Check if the trail level is breached this tick
+        breached = (self._pos ==  1 and ltp <= trail) or \
+                   (self._pos == -1 and ltp >= trail)
+        if not breached:
+            return
+
+        with self._lock:
+            # Re-check inside lock — a concurrent tick or on_candle_close
+            # may have already exited this position
+            if self._pos == 0 or self._intrabar_exit_fired:
+                return
+            self._intrabar_exit_fired = True
+
+            direction_str = "LONG" if self._pos == 1 else "SHORT"
+            logger.warning(
+                "INTRABAR TRAIL HIT (%s) — LTP=%.0f crossed trail=%.0f — "
+                "exiting immediately (not waiting for bar close)",
+                direction_str, ltp, trail
+            )
+
+            # Build a minimal signal object for _handle_exit
+            pos_at_tick   = self._pos
+            trail_at_tick = trail
+            ts_val        = ts
+
+            class _IntrabarTrailSignal:
+                action      = "EXIT_LONG"  if pos_at_tick ==  1 else "EXIT_SHORT"
+                reason      = "ATR Trail Intrabar"
+                bar_ts      = ts_val
+                norm_resid  = 0.0
+                vr          = 0.0
+                vel_norm    = 0.0
+                atr         = 0.0
+                trail_price = trail_at_tick
+
+            self._handle_exit(_IntrabarTrailSignal())
+
+    # ─────────────────────────────────────────────────────────
+    # Smart Limit Exit — saves spread cost vs blind MARKET order
+    # ─────────────────────────────────────────────────────────
+    def _smart_limit_exit(self, tag: str) -> Optional[float]:
+        """
+        Place a LIMIT exit order at current LTP instead of a MARKET order.
+        Poll for fill for config.LIMIT_ORDER_TIMEOUT_SECS seconds.
+        If not filled in time: cancel the LIMIT and return None so the
+        caller falls back to a MARKET order immediately.
+
+        Why this matters for Silver Mic:
+          During illiquid hours (post-midnight, pre-open) bid-ask spreads
+          can be 50-200 pts wide. A blind MARKET order fills at the far side
+          of the spread. A LIMIT at LTP typically fills within 1-3 seconds
+          during any active session, saving the full spread cost.
+
+        Returns: fill price (float) on success, None on timeout/failure.
+        """
+        timeout  = getattr(config, "LIMIT_ORDER_TIMEOUT_SECS", 7)
+        order_id = None
+        try:
+            ltp = self._get_current_ltp()
+            if not ltp:
+                logger.warning("SmartLimitExit: could not get current LTP — "
+                               "falling back to MARKET order")
+                return None
+
+            if self._pos == 1:
+                order_id = self.broker.place_order(
+                    "SELL", self._open_qty,
+                    order_type="LIMIT", price=ltp, tag=tag
+                )
+            else:
+                order_id = self.broker.place_order(
+                    "BUY", self._open_qty,
+                    order_type="LIMIT", price=ltp, tag=tag
+                )
+
+            logger.info(
+                "SmartLimitExit: LIMIT @ ₹%.0f placed (id=%s, timeout=%ds)",
+                ltp, order_id, timeout
+            )
+
+            deadline = time.time() + timeout
+            while time.time() < deadline:
+                order  = self.broker.get_order_status(order_id)
+                status = order.get("status", "").upper()
+                if status in ("COMPLETE", "FILLED"):
+                    fill         = float(order.get("average_price", ltp))
+                    spread_saved = abs(fill - ltp)
+                    logger.info(
+                        "SmartLimitExit: filled @ ₹%.0f  "
+                        "(limit=₹%.0f, spread saved ≈₹%.0f/lot)",
+                        fill, ltp, spread_saved
+                    )
+                    return fill
+                if status in ("REJECTED", "CANCELLED"):
+                    logger.warning(
+                        "SmartLimitExit: limit order %s (%s) — "
+                        "falling back to MARKET", status, order_id
+                    )
+                    return None
+                time.sleep(0.4)
+
+            # Timed out — cancel the unfilled limit and let caller MARKET exit
+            logger.warning(
+                "SmartLimitExit: LIMIT not filled in %ds @ ₹%.0f — "
+                "cancelling and falling back to MARKET order",
+                timeout, ltp
+            )
+            try:
+                self.broker.cancel_order(order_id)
+                time.sleep(0.3)   # brief pause so exchange processes the cancel
+            except Exception as ce:
+                logger.warning("SmartLimitExit: cancel failed: %s", ce)
+            return None
+
+        except Exception as e:
+            logger.error("SmartLimitExit error: %s — falling back to MARKET", e)
+            if order_id:
+                try:
+                    self.broker.cancel_order(order_id)
+                except Exception:
+                    pass
+            return None
+
+    def _get_current_ltp(self) -> Optional[float]:
+        """
+        Quick REST call to fetch current LTP for use as a LIMIT exit price.
+        Times out in 3 seconds so it never blocks the exit path for long.
+        """
+        try:
+            import requests as _req
+            url = "https://api.upstox.com/v2/market-quote/ltp"
+            headers = {
+                "Authorization": f"Bearer {self.broker.token}",
+                "Accept":        "application/json",
+            }
+            r = _req.get(url, headers=headers,
+                         params={"instrument_key": config.INSTRUMENT_KEY},
+                         timeout=3)
+            if r.status_code == 200:
+                data  = r.json().get("data", {})
+                quote = (
+                    data.get(config.INSTRUMENT_KEY) or
+                    data.get(config.INSTRUMENT_KEY.replace("|", "_")) or
+                    next(iter(data.values()), None)
+                )
+                if quote:
+                    ltp = float(quote.get("last_price", 0) or 0)
+                    return ltp if ltp > 0 else None
+        except Exception as e:
+            logger.debug("_get_current_ltp error: %s", e)
+        return None
+
     def _wait_for_fill(self, order_id: str, timeout: int = 15) -> float:
         """
         Polls order status until filled, then returns average fill price.
@@ -826,7 +1031,10 @@ class TradingEngine:
                 max(config.VR_LEN + 1, config.ATR_LEN * 3)
             )
             return
-        n = self.strategy.warmup(bars)
+        result = self.strategy.warmup(bars)
+        # Guard: warmup() should return bar count, but older/local versions may
+        # return None. Fall back to len(bars) so the log line never crashes.
+        n = result if isinstance(result, int) else len(bars)
         logger.info(
             "Strategy warmed up on %d × %d-min bars  (%.1f days of history)",
             n, config.CANDLE_INTERVAL,
@@ -1043,6 +1251,7 @@ class TradingEngine:
             self.feed = UpstoxFeed(
                 access_token    = self.broker.token,
                 on_candle_close = self.on_candle_close,
+                on_tick         = self.on_tick,
             )
         else:
             self.feed = RestLTPPoller(

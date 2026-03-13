@@ -58,9 +58,8 @@ class UpstoxBroker:
     # Account
     # ─────────────────────────────────────────────────────────
     def get_funds(self) -> float:
-        """Returns available margin in ₹."""
-        data = self._get("/user/get-funds-and-margin",
-                         params={"segment": "SEC"})   # SEC = securities segment (where MCX margin shows)
+        """Returns available margin in ₹. MCX futures margin shows under SEC segment."""
+        data  = self._get("/user/get-funds-and-margin", params={"segment": "SEC"})
         used  = data["data"].get("equity", {})
         avail = float(used.get("available_margin", 0))
         logger.info(f"Available margin: ₹{avail:,.0f}")
@@ -85,16 +84,29 @@ class UpstoxBroker:
         return None
 
     def get_net_quantity(self, instrument_key: str) -> int:
-        """
-        Returns net open quantity:
-          positive → long
-          negative → short
-          0        → flat
-        """
+        """Returns net open quantity: positive=long, negative=short, 0=flat."""
         pos = self.get_position_for(instrument_key)
         if pos is None:
             return 0
         return int(pos.get("quantity", 0))
+
+    def get_entry_price(self, instrument_key: str) -> float:
+        """
+        Returns the average entry price of the current open position.
+        Used on engine restart to recover _entry_px so P&L is correct.
+        Returns 0.0 if no position or price unavailable.
+        """
+        pos = self.get_position_for(instrument_key)
+        if pos is None:
+            return 0.0
+        qty = int(pos.get("quantity", 0))
+        if qty > 0:
+            return float(pos.get("buy_average_price", 0) or
+                         pos.get("average_price", 0))
+        elif qty < 0:
+            return float(pos.get("sell_average_price", 0) or
+                         pos.get("average_price", 0))
+        return 0.0
 
     # ─────────────────────────────────────────────────────────
     # Orders
@@ -177,6 +189,46 @@ class UpstoxBroker:
         """Buy to close short position."""
         return self.place_order("BUY", quantity,
                                 order_type=config.ORDER_TYPE, tag=tag)
+
+    def exit_smart(self, transaction_type: str, quantity: int,
+                   ltp: float, tag: str = "SMART_EXIT") -> tuple:
+        """
+        Smart exit: try LIMIT at LTP first, fall back to MARKET.
+
+        During low-volatility MCX hours spreads can be 50-200 pts wide.
+        A LIMIT at LTP usually fills in 1-3 seconds, saving the spread.
+        Falls back to MARKET after LIMIT_ORDER_TIMEOUT_SECS if unfilled.
+
+        Returns (order_id: str, was_limit: bool)
+        """
+        import time as _time
+        timeout  = getattr(config, "LIMIT_ORDER_TIMEOUT_SECS", 7)
+        limit_px = round(ltp, 1)
+        logger.info("Smart exit: LIMIT %s @ ₹%.1f (fallback MARKET in %ds)",
+                    transaction_type, limit_px, timeout)
+        order_id = self.place_order(transaction_type, quantity,
+                                    order_type="LIMIT", price=limit_px, tag=tag)
+        deadline = _time.time() + timeout
+        while _time.time() < deadline:
+            try:
+                order  = self.get_order_status(order_id)
+                status = order.get("status", "").upper()
+                if status in ("COMPLETE", "FILLED"):
+                    logger.info("Smart exit: LIMIT filled @ ₹%.0f",
+                                float(order.get("average_price", limit_px)))
+                    return order_id, True
+                if status in ("REJECTED", "CANCELLED"):
+                    logger.warning("Smart exit: LIMIT %s — falling to MARKET", status)
+                    break
+            except Exception as e:
+                logger.debug("Smart exit poll: %s", e)
+            _time.sleep(0.5)
+        logger.warning("Smart exit: LIMIT unfilled after %ds — placing MARKET", timeout)
+        self.cancel_order(order_id)
+        _time.sleep(0.2)
+        mkt_id = self.place_order(transaction_type, quantity,
+                                  order_type="MARKET", tag=tag + "_MKT")
+        return mkt_id, False
 
     def close_all_positions(self) -> None:
         """
