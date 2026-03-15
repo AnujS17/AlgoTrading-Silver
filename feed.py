@@ -508,15 +508,26 @@ class MarketDataStreamerFeed:
             return False
 
     def __init__(self, access_token: str, on_candle_close: Callable,
-                 on_tick: Optional[Callable] = None):
-        self.access_token = access_token
-        self.assembler    = CandleAssembler(config.CANDLE_INTERVAL, on_candle_close, on_tick)
-        self._stop        = threading.Event()
-        self._streamer    = None
+                 on_tick: Optional[Callable] = None,
+                 on_reconnect: Optional[Callable] = None):
+        self.access_token  = access_token
+        self.assembler     = CandleAssembler(config.CANDLE_INTERVAL, on_candle_close, on_tick)
+        self._stop         = threading.Event()
+        self._streamer     = None
+        self._on_reconnect = on_reconnect
+        self._first_connect = True
 
     def _handle_open(self):
         logger.info("MarketDataStreamer connected — subscribed to %s",
                     config.INSTRUMENT_KEY)
+        if self._first_connect:
+            self._first_connect = False
+        elif self._on_reconnect:
+            logger.info("MarketDataStreamer reconnected — triggering missed-bar catch-up")
+            try:
+                self._on_reconnect()
+            except Exception as e:
+                logger.error("on_reconnect callback error: %s", e)
 
     def _handle_message(self, message: dict):
         """SDK delivers a fully-decoded dict. Extract LTP and feed assembler."""
@@ -598,11 +609,14 @@ class RawWebSocketFeed:
             return False
 
     def __init__(self, access_token: str, on_candle_close: Callable,
-                 on_tick: Optional[Callable] = None):
-        self.access_token = access_token
-        self.assembler    = CandleAssembler(config.CANDLE_INTERVAL, on_candle_close, on_tick)
-        self._ws          = None
-        self._stop        = threading.Event()
+                 on_tick: Optional[Callable] = None,
+                 on_reconnect: Optional[Callable] = None):
+        self.access_token  = access_token
+        self.assembler     = CandleAssembler(config.CANDLE_INTERVAL, on_candle_close, on_tick)
+        self._ws           = None
+        self._stop         = threading.Event()
+        self._on_reconnect = on_reconnect   # called after every reconnect (not first connect)
+        self._first_connect = True          # flag so we skip catch-up on initial startup
 
     def _subscribe_msg(self) -> str:
         return json.dumps({
@@ -619,6 +633,16 @@ class RawWebSocketFeed:
         logger.info("RawWebSocket connected — subscribing to %s", config.INSTRUMENT_KEY)
         # Upstox v3 REQUIRES the subscription message as a BINARY WebSocket frame.
         ws.send(self._subscribe_msg().encode("utf-8"), opcode=_ws_lib.ABNF.OPCODE_BINARY)
+
+        if self._first_connect:
+            self._first_connect = False
+        elif self._on_reconnect:
+            # This is a reconnect (not startup) — notify engine to catch up missed bars
+            logger.info("RawWebSocket reconnected — triggering missed-bar catch-up")
+            try:
+                self._on_reconnect()
+            except Exception as e:
+                logger.error("on_reconnect callback error: %s", e)
 
     def _on_message(self, ws, message):
         if not isinstance(message, bytes):
@@ -824,11 +848,13 @@ class UpstoxFeed:
     """
 
     def __init__(self, access_token: str, on_candle_close: Callable,
-                 on_tick: Optional[Callable] = None):
-        self.access_token = access_token
-        self._callback    = on_candle_close
-        self._on_tick     = on_tick
-        self._feed        = None
+                 on_tick: Optional[Callable] = None,
+                 on_reconnect: Optional[Callable] = None):
+        self.access_token  = access_token
+        self._callback     = on_candle_close
+        self._on_tick      = on_tick
+        self._on_reconnect = on_reconnect
+        self._feed         = None
 
     def start(self):
         # ── Tier 1: MarketDataStreamer ─────────────────────────
@@ -836,7 +862,7 @@ class UpstoxFeed:
             logger.info("Tier 1 selected: MarketDataStreamer (SDK v3)")
             try:
                 self._feed = MarketDataStreamerFeed(self.access_token, self._callback,
-                                                    self._on_tick)
+                                                    self._on_tick, self._on_reconnect)
                 self._feed.start()
                 return
             except Exception as e:
@@ -848,7 +874,7 @@ class UpstoxFeed:
             try:
                 _get_authorized_ws_url(self.access_token)   # pre-flight check
                 self._feed = RawWebSocketFeed(self.access_token, self._callback,
-                                              self._on_tick)
+                                              self._on_tick, self._on_reconnect)
                 self._feed.start()
                 return
             except Exception as e:

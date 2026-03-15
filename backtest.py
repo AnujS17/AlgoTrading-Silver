@@ -6,17 +6,24 @@ Fetches data from the Upstox v3 historical API, feeds bars one-by-one through
 KalmanScalperStrategy, simulates fills, and produces a full performance
 report + trade log CSV + equity curve PNG.
 
-Kalman strategy coefficients (KALM_Q, KALM_R, ENTRY_THRESH, EXIT_THRESH,
+WORKFLOW (mirrors engine.py exactly):
+  1. Fetch WARMUP_DAYS of bars before backtest start → strategy.warmup()
+     (identical to engine._warmup_strategy() on every live startup)
+  2. Fetch the actual backtest period bars
+  3. Run BacktestEngine.run() — one bar at a time, same signal → fill flow
+  4. Report + save CSV + plot
+
+All strategy parameters (KALM_Q, KALM_R, ENTRY_THRESH, EXIT_THRESH,
 VR_LEN, VR_THRESHOLD, VEL_LEN, MAX_VEL_MULT, ATR_LEN, ATR_MULT, COOLDOWN)
-are read from config.py — all other parameters are set in the
-CONFIGURABLE PARAMETERS block below.
+are read from config.py — edit there, not here.
 
 Usage:
-    python backtest.py                       # run with defaults below
-    python backtest.py --days 90             # override date range
-    python backtest.py --csv mydata.csv      # use local OHLCV CSV
-    python backtest.py --days 60 --slip 2.0  # with slippage
-    python backtest.py --no-plot             # skip chart
+    python backtest.py                              # defaults in block below
+    python backtest.py --start 2026-01-01 --end 2026-03-13
+    python backtest.py --days 60                    # rolling window from today
+    python backtest.py --csv mydata.csv             # skip API fetch
+    python backtest.py --warmup-days 30 --slip 2.0
+    python backtest.py --no-warmup --no-plot        # debug: disable warmup
 
 CSV format (if using --csv):
     datetime,open,high,low,close,volume
@@ -43,59 +50,73 @@ from strategy import KalmanScalperStrategy, Signal
 
 
 # ═════════════════════════════════════════════════════════════
-#  CONFIGURABLE PARAMETERS — edit everything in this block
+#  CONFIGURABLE PARAMETERS — edit everything in this block.
+#  Strategy coefficients live in config.py, not here.
 # ═════════════════════════════════════════════════════════════
 
 # ── Instrument ────────────────────────────────────────────────
-INSTRUMENT_KEY  = "MCX_FO|466029"      # Upstox instrument key
-INSTRUMENT_NAME = "SILVERMIC"          # Display label only
+INSTRUMENT_KEY  = config.INSTRUMENT_KEY
+INSTRUMENT_NAME = config.INSTRUMENT_NAME
 
 # ── Date range ────────────────────────────────────────────────
-# Option A: rolling window — fetch BACKTEST_DAYS calendar days back from today
-# Option B: fixed window   — set USE_FIXED_DATES = True and fill FIXED_START/END
-USE_FIXED_DATES = False
-FIXED_START     = "2025-10-01"         # "YYYY-MM-DD", used only when USE_FIXED_DATES = True
-FIXED_END       = "2026-03-10"         # "YYYY-MM-DD", used only when USE_FIXED_DATES = True
-BACKTEST_DAYS   = 30                   # calendar days back from today (Option A default)
+# Option A: fixed window (USE_FIXED_DATES = True)
+# Option B: rolling window from today (USE_FIXED_DATES = False, use --days N)
+USE_FIXED_DATES = True
+FIXED_START     = "2026-02-13"    # "YYYY-MM-DD" — start of backtest period
+FIXED_END       = "2026-03-13"    # "YYYY-MM-DD" — end   of backtest period
+BACKTEST_DAYS   = 30              # calendar days back from today (Option B)
+
+# ── Warmup ────────────────────────────────────────────────────
+# Mirrors engine.py: WARMUP_DAYS of history replayed through strategy.warmup()
+# before any backtest bar is evaluated. Prevents cold-start phantom signals.
+# Reads config.WARMUP_DAYS by default; override with --warmup-days N.
+WARMUP_DAYS     = getattr(config, "WARMUP_DAYS", 20)
 
 # ── Candle interval ────────────────────────────────────────────
-CANDLE_INTERVAL = 5                    # minutes
+CANDLE_INTERVAL = config.CANDLE_INTERVAL     # minutes
 
-# ── Session filter ────────────────────────────────────────────
-USE_SESSION  = True
-SESS_START   = (9,  0)                 # (hour, minute) IST
-SESS_END     = (23, 55)                # (hour, minute) IST
+# ── Session filter — mirrors config.py ────────────────────────
+USE_SESSION  = config.USE_SESSION
+SESS_START   = config.SESS_START             # (hour, minute) IST
+SESS_END     = config.SESS_END               # (hour, minute) IST
 
 # ── Direction ─────────────────────────────────────────────────
-DIRECTION    = "Both"                  # "Long Only" | "Short Only" | "Both"
+DIRECTION    = config.DIRECTION              # "Long Only" | "Short Only" | "Both"
+
+# ── Overnight behaviour — mirrors config.py ───────────────────
+# False → engine force-closes positions at session end (intraday config).
+# True  → positions can survive overnight (NRML/Delivery).
+ALLOW_OVERNIGHT = getattr(config, "ALLOW_OVERNIGHT", False)
 
 # ── Position sizing ────────────────────────────────────────────
-LOT_SIZE     = 2                       # kg per lot (Silver Micro = 1 kg/lot)
-TRADE_QTY    = 1                       # number of lots per trade
+LOT_SIZE     = config.LOT_SIZE          # kg per lot (Silver Micro = 1 kg/lot)
+TRADE_QTY    = 1                        # number of lots per trade
 
 # ── Risk limits ────────────────────────────────────────────────
-MAX_DAILY_LOSS     = 10000             # ₹ — no new entries after this daily loss
-MAX_TRADES_PER_DAY = 10               # circuit breaker on over-trading
+MAX_DAILY_LOSS     = config.MAX_DAILY_LOSS
+MAX_TRADES_PER_DAY = config.MAX_TRADES_PER_DAY
 
 # ── Fill / cost model ─────────────────────────────────────────
 SLIPPAGE_PTS       = 0.0              # one-way slippage in price points
 COMMISSION_PER_LOT = 5.0             # ₹ per lot per side (one-way)
 
 # ── Output ────────────────────────────────────────────────────
-OUT_DIR       = "."                    # directory for CSV + PNG outputs
-GENERATE_PLOT = True                   # set False on headless servers
+OUT_DIR       = "."
+GENERATE_PLOT = True
 
 # ═════════════════════════════════════════════════════════════
 #  END OF CONFIGURABLE PARAMETERS
 # ═════════════════════════════════════════════════════════════
 
 
-# Push session / direction / interval into config so strategy.py reads them
+# Push session / direction / interval / overnight into config so
+# strategy.py reads the backtest values, not whatever was in config.py.
 config.USE_SESSION     = USE_SESSION
 config.SESS_START      = SESS_START
 config.SESS_END        = SESS_END
 config.DIRECTION       = DIRECTION
 config.CANDLE_INTERVAL = CANDLE_INTERVAL
+config.ALLOW_OVERNIGHT = ALLOW_OVERNIGHT      # FIX: was missing; session-end logic needs it
 
 
 # ─────────────────────────────────────────────────────────────
@@ -138,15 +159,16 @@ def _load_token() -> Optional[str]:
 
 # ─────────────────────────────────────────────────────────────
 # Data fetching — Upstox v3 historical candle API
+# Mirrors engine.py _fetch_historical_bars() URL structure.
 # ─────────────────────────────────────────────────────────────
 def fetch_historical_bars(from_dt: str, to_dt: str, access_token: str) -> list:
     """
-    Fetch CANDLE_INTERVAL-minute bars from Upstox v3.
+    Fetch CANDLE_INTERVAL-minute bars from Upstox v3 API.
 
-    Primary:  /v3/historical-candle/{instrument}/minutes/{N}/{from}/{to}
-    Fallback: if the primary returns an error or empty data, fetches 1-minute
-              bars and aggregates them up to CANDLE_INTERVAL minutes in-memory.
+    URL: /v3/historical-candle/{instrument}/minutes/{N}/{to}/{from}
+    Note: Upstox URL order is to_dt first, from_dt second.
 
+    Falls back to 1-minute aggregation if N-minute endpoint returns empty.
     Returns list of dicts {ts, open, high, low, close, volume}, oldest-first.
     """
     import requests as req
@@ -161,12 +183,10 @@ def fetch_historical_bars(from_dt: str, to_dt: str, access_token: str) -> list:
     # ── Primary: N-minute bars ────────────────────────────────
     url = (
         f"https://api.upstox.com/v3/historical-candle/"
-        f"{instrument}/minutes/{N}/{from_dt}/{to_dt}"
+        f"{instrument}/minutes/{N}/{to_dt}/{from_dt}"
     )
-    logger.info(
-        "Fetching %d-min bars from Upstox v3: %s → %s", N, from_dt, to_dt
-    )
-    logger.info("Request URL: %s", url)
+    logger.info("Fetching %d-min bars: %s → %s", N, from_dt, to_dt)
+    logger.info("URL: %s", url)
     try:
         r = req.get(url, headers=headers, timeout=30)
         if r.status_code == 200:
@@ -174,53 +194,42 @@ def fetch_historical_bars(from_dt: str, to_dt: str, access_token: str) -> list:
             if raw:
                 bars = _parse_upstox_candles(raw)
                 logger.info(
-                    "Primary fetch OK: %d × %d-min bars  (%s → %s)",
+                    "Primary fetch OK: %d × %d-min bars (%s → %s)",
                     len(bars), N,
                     bars[0]["ts"].strftime("%Y-%m-%d"),
                     bars[-1]["ts"].strftime("%Y-%m-%d"),
                 )
                 return bars
-            logger.warning(
-                "Primary fetch returned 0 candles for %d-min — "
-                "falling back to 1-min aggregation.", N
-            )
+            logger.warning("Primary fetch: 0 candles — falling back to 1-min aggregation.")
         else:
-            logger.warning(
-                "Primary fetch HTTP %d: %s — falling back to 1-min aggregation.",
-                r.status_code, r.text[:200]
-            )
+            logger.warning("Primary fetch HTTP %d — falling back to 1-min.", r.status_code)
     except Exception as e:
         logger.warning("Primary fetch error: %s — falling back to 1-min.", e)
 
     # ── Fallback: 1-minute bars → aggregate ──────────────────
-    logger.info(
-        "Fallback: fetching 1-min bars and aggregating to %d-min...", N
-    )
+    logger.info("Fallback: fetching 1-min bars and aggregating to %d-min...", N)
     url_1min = (
         f"https://api.upstox.com/v3/historical-candle/"
-        f"{instrument}/minutes/1/{from_dt}/{to_dt}"
+        f"{instrument}/minutes/1/{to_dt}/{from_dt}"
     )
-    logger.info("Request URL (1-min fallback): %s", url_1min)
     try:
         r = req.get(url_1min, headers=headers, timeout=30)
         if r.status_code != 200:
             raise RuntimeError(
                 f"1-min fallback HTTP {r.status_code}: {r.text[:300]}\n"
-                "Check INSTRUMENT_KEY and ensure the token is valid."
+                "Check INSTRUMENT_KEY and token validity."
             )
         raw_1min = r.json().get("data", {}).get("candles", [])
         if not raw_1min:
             raise RuntimeError(
                 "Both N-min and 1-min fetches returned 0 candles. "
-                "The contract may be expired — check INSTRUMENT_KEY."
+                "Contract may be expired — check INSTRUMENT_KEY."
             )
         bars_1min = _parse_upstox_candles(raw_1min)
         bars      = _aggregate_to_nmin(bars_1min, N)
         logger.info(
-            "Fallback OK: %d 1-min bars → %d × %d-min bars  (%s → %s)",
-            len(bars_1min), len(bars), N,
-            bars[0]["ts"].strftime("%Y-%m-%d") if bars else "—",
-            bars[-1]["ts"].strftime("%Y-%m-%d") if bars else "—",
+            "Fallback OK: %d 1-min bars → %d × %d-min bars",
+            len(bars_1min), len(bars), N
         )
         return bars
     except RuntimeError:
@@ -312,15 +321,24 @@ class BacktestEngine:
     """
     Runs the live strategy bar-by-bar over historical data.
 
-    Fill model:
-      - Signal fires on bar close; fill simulated at NEXT bar's open.
-      - Slippage applied directionally: buy +slip, sell -slip.
-      - Commission charged round-trip (open + close).
+    WORKFLOW mirrors engine.py:
+      1. warmup(bars)  → strategy.warmup() with pre-period history
+      2. run(bars)     → bar-by-bar: signal → fill → P&L
 
-    Risk model mirrors engine.py:
+    Fill model:
+      - Entry signals  : fill at NEXT bar's open (signal fires on bar close)
+      - Reversion exits: fill at NEXT bar's open (same as entry logic)
+      - ATR Trail exits: fill at CURRENT bar's close
+                         (Pine stop exits trigger during the bar at stop price;
+                          bar close approximates this, and avoids unrealistic
+                          next-bar gap fills on a stop that already triggered)
+      - Session-end    : fill at CURRENT bar's close (immediate forced close)
+
+    Risk model mirrors engine.py RiskManager:
+      - Daily loss limit (MAX_DAILY_LOSS)
+      - Max trades per day (MAX_TRADES_PER_DAY)
       - One position at a time
-      - Daily loss limit (MAX_DAILY_LOSS) enforced
-      - Trade count limit (MAX_TRADES_PER_DAY) enforced
+      - Session-end forced close when ALLOW_OVERNIGHT=False
     """
 
     def __init__(self,
@@ -350,9 +368,167 @@ class BacktestEngine:
             slip_pts, commission_per_lot, self.qty
         )
 
+    # ─────────────────────────────────────────────────────────
+    # Warmup — FIX: was missing entirely in original backtest.
+    # Matches engine.py _warmup_strategy() + strategy.warmup().
+    # ─────────────────────────────────────────────────────────
+    def warmup(self, bars: list) -> None:
+        """
+        Replay pre-period historical bars through strategy.warmup() to
+        initialise all indicators (Kalman, ATR, VR, velocity EMA) before
+        any backtest bar is evaluated.
+
+        Without this, the first ~50 bars have uninitialised indicators and
+        generate phantom signals that do not exist on TradingView. This is
+        exactly what engine.py's _warmup_strategy() prevents on live startup.
+        """
+        if not bars:
+            logger.warning(
+                "Warmup: 0 bars provided — strategy will start cold. "
+                "Indicators may diverge from TradingView for first ~%d bars.",
+                max(config.VR_LEN + 1, config.ATR_LEN * 3)
+            )
+            return
+        logger.info("=" * 55)
+        logger.info("  STRATEGY WARMUP — replaying %d pre-period bars", len(bars))
+        logger.info("  (%s → %s)",
+                    bars[0]["ts"].strftime("%Y-%m-%d"),
+                    bars[-1]["ts"].strftime("%Y-%m-%d"))
+        logger.info("=" * 55)
+        self.strategy.warmup(bars)
+        logger.info(
+            "Warmup complete. Kalman x=%.1f v=%.4f | ATR=%.1f",
+            self.strategy._kx or 0,
+            self.strategy._kv,
+            self.strategy._atr or 0,
+        )
+
+    # ─────────────────────────────────────────────────────────
+    # Main backtest loop
+    # ─────────────────────────────────────────────────────────
+    def run(self, bars: list) -> None:
+        if len(bars) < 2:
+            raise ValueError("Need at least 2 bars to backtest.")
+
+        logger.info("=" * 60)
+        logger.info("  BACKTEST RUN — %d bars  (%s → %s)",
+                    len(bars),
+                    bars[0]["ts"].strftime("%Y-%m-%d %H:%M"),
+                    bars[-1]["ts"].strftime("%Y-%m-%d %H:%M"))
+        logger.info("=" * 60)
+
+        # Cache session-end values for the tight inner loop
+        allow_overnight = ALLOW_OVERNIGHT
+        sess_e_mins     = SESS_END[0] * 60 + SESS_END[1]
+        use_session     = USE_SESSION
+
+        pending_signal: Optional[Signal] = None
+
+        for i, bar in enumerate(bars):
+            ts = bar["ts"]
+            self._check_day_reset(ts)
+
+            # ── Fill any pending signal at this bar's open ─────
+            if pending_signal is not None:
+                self._execute_fill(pending_signal, bar)
+                pending_signal = None
+
+            # ── FIX: Session-end forced close ─────────────────
+            # Mirrors engine.py on_candle_close() session-end block.
+            # When ALLOW_OVERNIGHT=False, close any open position on the
+            # last bar of the session (at close price — immediate fill).
+            if (not allow_overnight and self._pos != 0 and use_session):
+                bar_mins = ts.hour * 60 + ts.minute
+                if bar_mins >= sess_e_mins - CANDLE_INTERVAL:
+                    sess_end_signal = Signal(
+                        action  = "EXIT_LONG" if self._pos == 1 else "EXIT_SHORT",
+                        reason  = "Session End (ALLOW_OVERNIGHT=False)",
+                        bar_ts  = ts,
+                    )
+                    logger.info(
+                        "SESSION END close at bar %02d:%02d (sess_end=%02d:%02d, pos=%d)",
+                        ts.hour, ts.minute,
+                        SESS_END[0], SESS_END[1], self._pos
+                    )
+                    self._execute_fill(sess_end_signal, bar, force_close=True)
+                    self._equity.append((ts, self._cum_pnl))
+                    continue   # skip strategy this bar — already closed
+
+            # ── Run strategy ───────────────────────────────────
+            signal = self.strategy.process_bar(bar)
+
+            # Record equity snapshot (unrealised included)
+            unreal = self._unrealised_pnl(bar["close"])
+            self._equity.append((ts, self._cum_pnl + unreal))
+
+            if signal is None:
+                continue
+
+            # ── Route signal ───────────────────────────────────
+            if signal.action in ("BUY", "SELL"):
+                ok, reason = self._entry_allowed()
+                if ok:
+                    if i + 1 < len(bars):
+                        pending_signal = signal   # fill at next bar open
+                else:
+                    logger.debug("Entry blocked: %s", reason)
+
+            elif signal.action in ("EXIT_LONG", "EXIT_SHORT"):
+                if self._pos != 0:
+                    if signal.reason == "ATR Trail":
+                        # FIX: ATR Trail detected using current bar's low/high.
+                        # Pine fills stop exits during the same bar at stop price.
+                        # Fill at current bar close (best single-price approximation
+                        # without stop price in Signal). Never pend to next open —
+                        # that risks a gap-fill far below the stop on the same move.
+                        self._execute_fill(signal, bar, force_close=True)
+                    elif i + 1 < len(bars):
+                        pending_signal = signal   # reversion exit: fill at next open
+                    else:
+                        self._execute_fill(signal, bar, force_close=True)
+
+        # ── Force-close any position still open at end of data ─
+        if self._pos != 0 and bars:
+            logger.warning("Open position at end of data — closing at last close.")
+            last = bars[-1]
+            eod_signal = Signal(
+                action = "EXIT_LONG" if self._pos == 1 else "EXIT_SHORT",
+                reason = "EndOfData",
+                bar_ts = last["ts"],
+            )
+            self._execute_fill(eod_signal, last, force_close=True)
+
+        logger.info("Backtest run complete — %d trades", len(self.trades))
+
+    # ─────────────────────────────────────────────────────────
+    # Fill execution
+    # ─────────────────────────────────────────────────────────
+    def _execute_fill(self, signal: Signal, fill_bar: dict, force_close: bool = False):
+        """
+        force_close=True  → fill at bar's close  (trail stops, session end, EOD)
+        force_close=False → fill at bar's open   (normal next-bar fills)
+        """
+        px = fill_bar["close"] if force_close else fill_bar["open"]
+
+        if signal.action == "BUY":
+            self._open_position(px + self.slip, 1, signal)
+        elif signal.action == "SELL":
+            self._open_position(px - self.slip, -1, signal)
+        elif signal.action == "EXIT_LONG" and self._pos == 1:
+            self._close_position(px - self.slip, fill_bar["ts"], signal.reason)
+        elif signal.action == "EXIT_SHORT" and self._pos == -1:
+            self._close_position(px + self.slip, fill_bar["ts"], signal.reason)
+
     def _check_day_reset(self, ts: datetime):
         day = ts.date()
         if day != self._current_day:
+            if self._current_day is not None:
+                logger.info(
+                    "Day end: %s | P&L=₹%s | trades=%d",
+                    self._current_day,
+                    f"{self._daily_pnl:+,.0f}",
+                    self._daily_trades
+                )
             self._current_day  = day
             self._daily_pnl    = 0.0
             self._daily_trades = 0
@@ -365,73 +541,6 @@ class BacktestEngine:
         if self._daily_trades >= MAX_TRADES_PER_DAY:
             return False, "max_trades_reached"
         return True, "OK"
-
-    def run(self, bars: list) -> None:
-        if len(bars) < 2:
-            raise ValueError("Need at least 2 bars to backtest.")
-
-        logger.info("=" * 60)
-        logger.info("  BACKTEST START — %d bars  (%s → %s)",
-                    len(bars),
-                    bars[0]["ts"].strftime("%Y-%m-%d %H:%M"),
-                    bars[-1]["ts"].strftime("%Y-%m-%d %H:%M"))
-        logger.info("=" * 60)
-
-        pending_signal: Optional[Signal] = None
-
-        for i, bar in enumerate(bars):
-            ts = bar["ts"]
-            self._check_day_reset(ts)
-
-            # Fill pending signal at this bar's open
-            if pending_signal is not None:
-                self._execute_fill(pending_signal, bar)
-                pending_signal = None
-
-            signal = self.strategy.process_bar(bar)
-
-            unreal = self._unrealised_pnl(bar["close"])
-            self._equity.append((ts, self._cum_pnl + unreal))
-
-            if signal is None:
-                continue
-
-            if signal.action in ("BUY", "SELL"):
-                ok, reason = self._entry_allowed()
-                if ok:
-                    if i + 1 < len(bars):
-                        pending_signal = signal
-                else:
-                    logger.debug("Entry blocked: %s", reason)
-
-            elif signal.action in ("EXIT_LONG", "EXIT_SHORT"):
-                if self._pos != 0:
-                    if i + 1 < len(bars):
-                        pending_signal = signal
-                    else:
-                        self._execute_fill(signal, bar, force_close=True)
-
-        # Force-close any open position at end of data
-        if self._pos != 0 and bars:
-            logger.warning("Open position at end of data — closing at last close.")
-            last      = bars[-1]
-            direction = -self._pos
-            px        = last["close"] + direction * self.slip
-            self._close_position(px, last["ts"], "EndOfData")
-
-        logger.info("Backtest complete — %d trades", len(self.trades))
-
-    def _execute_fill(self, signal: Signal, fill_bar: dict, force_close: bool = False):
-        px = fill_bar["close"] if force_close else fill_bar["open"]
-
-        if signal.action == "BUY":
-            self._open_position(px + self.slip, 1, signal)
-        elif signal.action == "SELL":
-            self._open_position(px - self.slip, -1, signal)
-        elif signal.action == "EXIT_LONG" and self._pos == 1:
-            self._close_position(px - self.slip, fill_bar["ts"], signal.reason)
-        elif signal.action == "EXIT_SHORT" and self._pos == -1:
-            self._close_position(px + self.slip, fill_bar["ts"], signal.reason)
 
     def _open_position(self, fill_px: float, direction: int, signal: Signal):
         self._pos           = direction
@@ -452,7 +561,7 @@ class BacktestEngine:
         else:
             gross_pnl = (self._entry_px - fill_px) * self.qty * self.lot_size
 
-        total_comm    = self.comm * self.qty * 2   # open + close
+        total_comm    = self.comm * self.qty * 2   # open + close sides
         net_pnl       = gross_pnl - total_comm
         self._cum_pnl    += net_pnl
         self._daily_pnl  += net_pnl
@@ -472,9 +581,12 @@ class BacktestEngine:
         })
 
         logger.info(
-            "CLOSE %s @ %.0f  |  net P&L=₹%+,.0f  |  cum=₹%+,.0f  |  reason=%s",
+            "CLOSE %s @ %.0f  |  net P&L=₹%s  |  cum=₹%s  |  reason=%s",
             "LONG" if direction == 1 else "SHORT",
-            fill_px, net_pnl, self._cum_pnl, reason
+            fill_px,
+            f"{net_pnl:+,.0f}",
+            f"{self._cum_pnl:+,.0f}",
+            reason
         )
 
         self._pos      = 0
@@ -570,7 +682,8 @@ def compute_metrics(trades: list, equity_curve: list) -> dict:
     }
 
 
-def print_report(m: dict, bars: list, slip: float, comm: float):
+def print_report(m: dict, bars: list, warmup_bars_count: int,
+                 slip: float, comm: float):
     sep   = "─" * 58
     start = bars[0]["ts"].strftime("%Y-%m-%d")
     end   = bars[-1]["ts"].strftime("%Y-%m-%d")
@@ -578,9 +691,12 @@ def print_report(m: dict, bars: list, slip: float, comm: float):
     print(f"\n{'═'*58}")
     print(f"  KALMAN SCALPER — BACKTEST REPORT")
     print(f"  {INSTRUMENT_NAME} ({INSTRUMENT_KEY})")
-    print(f"  Period  : {start}  →  {end}  ({m['trading_days']} trading days)")
-    print(f"  Interval: {CANDLE_INTERVAL} min  |  "
+    print(f"  Period    : {start}  →  {end}  ({m['trading_days']} trading days)")
+    print(f"  Interval  : {CANDLE_INTERVAL} min  |  "
           f"Slip: {slip} pts  |  Comm: ₹{comm}/lot/side")
+    print(f"  Warmup    : {warmup_bars_count} pre-period bars replayed "
+          f"({'cold start — no warmup bars fetched' if warmup_bars_count == 0 else 'indicators converged before bar 1'})")
+    print(f"  Overnight : {'ALLOWED (NRML)' if ALLOW_OVERNIGHT else 'DISABLED — positions closed at session end'}")
     print(f"{'═'*58}")
 
     print(f"\n  TRADE SUMMARY")
@@ -701,20 +817,51 @@ def plot_equity(equity_curve: list, trades: list, filepath: str):
 
 
 # ─────────────────────────────────────────────────────────────
-# CLI entry point
+# CLI
 # ─────────────────────────────────────────────────────────────
 
 def parse_args():
     p = argparse.ArgumentParser(
-        description="Backtest the Kalman Adaptive Scalper."
+        description="Backtest the Kalman Adaptive Scalper (mirrors live engine workflow).",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  python backtest.py
+  python backtest.py --start 2026-01-01 --end 2026-03-13
+  python backtest.py --days 60 --slip 2.0
+  python backtest.py --csv mydata.csv --no-warmup
+  python backtest.py --warmup-days 30 --no-plot
+        """
+    )
+    p.add_argument(
+        "--start", type=str, default=None,
+        metavar="YYYY-MM-DD",
+        help=f"Backtest start date (default: FIXED_START={FIXED_START})"
+    )
+    p.add_argument(
+        "--end", type=str, default=None,
+        metavar="YYYY-MM-DD",
+        help=f"Backtest end date (default: FIXED_END={FIXED_END})"
     )
     p.add_argument(
         "--days", type=int, default=None,
-        help=f"Calendar days back from today (default: {BACKTEST_DAYS})"
+        help=f"Rolling: calendar days back from today (default: {BACKTEST_DAYS}). "
+             "Ignored when --start/--end are given."
+    )
+    p.add_argument(
+        "--warmup-days", type=int, default=WARMUP_DAYS,
+        help=f"Pre-period bars for strategy warmup (default: {WARMUP_DAYS}, from config.WARMUP_DAYS). "
+             "Mirrors engine.py WARMUP_DAYS. Set 0 to disable."
+    )
+    p.add_argument(
+        "--no-warmup", action="store_true",
+        help="Skip strategy warmup (cold start). Useful for debugging only — "
+             "produces phantom signals that do not match TradingView."
     )
     p.add_argument(
         "--csv", type=str, default=None,
-        help="Path to local OHLCV CSV file (skips API fetch)"
+        help="Path to local OHLCV CSV (skips API fetch for backtest bars). "
+             "Warmup bars are still fetched from API unless --no-warmup is set."
     )
     p.add_argument(
         "--slip", type=float, default=SLIPPAGE_PTS,
@@ -735,12 +882,19 @@ def parse_args():
     return p.parse_args()
 
 
+# ─────────────────────────────────────────────────────────────
+# Entry point
+# ─────────────────────────────────────────────────────────────
+
 if __name__ == "__main__":
     args = parse_args()
     os.makedirs(args.out_dir, exist_ok=True)
 
-    # ── 1. Resolve date range ─────────────────────────────────
-    if USE_FIXED_DATES:
+    # ── 1. Resolve backtest date range ────────────────────────
+    if args.start and args.end:
+        from_dt = args.start
+        to_dt   = args.end
+    elif USE_FIXED_DATES and not args.days:
         from_dt = FIXED_START
         to_dt   = FIXED_END
     else:
@@ -749,22 +903,54 @@ if __name__ == "__main__":
         to_dt   = today.strftime("%Y-%m-%d")
         from_dt = (today - timedelta(days=days)).strftime("%Y-%m-%d")
 
-    # ── 2. Load bars ──────────────────────────────────────────
+    warmup_days = 0 if args.no_warmup else args.warmup_days
+
+    print(f"\n{'═'*58}")
+    print(f"  KALMAN ADAPTIVE SCALPER — BACKTEST")
+    print(f"  {INSTRUMENT_NAME} | {CANDLE_INTERVAL}-min bars")
+    print(f"  Backtest : {from_dt}  →  {to_dt}")
+    print(f"  Warmup   : {warmup_days} pre-period days")
+    print(f"  Slip={args.slip} pts  |  Comm=₹{args.comm}/lot/side")
+    print(f"{'═'*58}\n")
+
+    # ── 2. Load token (needed for API fetches) ────────────────
+    token = None
+    if not args.csv or (warmup_days > 0 and not args.no_warmup):
+        token = _load_token()
+        if not token:
+            print(
+                "\nError: No valid Upstox token found.\n"
+                "Run 'python auth.py' first, or pass --csv <file> --no-warmup.\n"
+            )
+            sys.exit(1)
+
+    # ── 3. Fetch warmup bars (before backtest period) ─────────
+    # Mirrors engine.py: _warmup_strategy() fetches WARMUP_DAYS before
+    # live session starts. We do the same — separate API call for pre-period bars.
+    warmup_bars = []
+    if warmup_days > 0 and not args.no_warmup and token:
+        from_date     = date.fromisoformat(from_dt)
+        warmup_to_dt  = (from_date - timedelta(days=1)).strftime("%Y-%m-%d")
+        warmup_from_dt = (from_date - timedelta(days=warmup_days)).strftime("%Y-%m-%d")
+        print(f"  Fetching warmup bars: {warmup_from_dt} → {warmup_to_dt}")
+        try:
+            warmup_bars = fetch_historical_bars(warmup_from_dt, warmup_to_dt, token)
+            print(f"  Warmup: {len(warmup_bars)} bars fetched\n")
+        except RuntimeError as e:
+            print(f"\n  Warmup fetch warning: {e}")
+            print("  Continuing with cold start — results may diverge from TradingView.\n")
+
+    # ── 4. Load backtest bars ─────────────────────────────────
     if args.csv:
         if not os.path.exists(args.csv):
             print(f"Error: CSV file not found: {args.csv}")
             sys.exit(1)
         bars = load_csv_bars(args.csv)
     else:
-        token = _load_token()
-        if not token:
-            print(
-                "\nError: No valid Upstox token found.\n"
-                "Run 'python auth.py' first, or pass --csv <file>.\n"
-            )
-            sys.exit(1)
+        print(f"  Fetching backtest bars: {from_dt} → {to_dt}")
         try:
             bars = fetch_historical_bars(from_dt, to_dt, token)
+            print(f"  Backtest: {len(bars)} bars fetched\n")
         except RuntimeError as e:
             print(f"\nFetch error: {e}\n")
             sys.exit(1)
@@ -773,19 +959,29 @@ if __name__ == "__main__":
         print(f"Only {len(bars)} bars — need at least 50 for meaningful results.")
         sys.exit(1)
 
-    # ── 3. Run backtest ───────────────────────────────────────
+    # ── 5. Initialise engine ──────────────────────────────────
     engine = BacktestEngine(slip_pts=args.slip, commission_per_lot=args.comm)
+
+    # ── 6. Warmup strategy (mirrors engine._warmup_strategy()) ─
+    if warmup_bars:
+        engine.warmup(warmup_bars)
+    elif not args.no_warmup:
+        print("  WARNING: No warmup bars available — cold start.\n"
+              "  First ~50 bars will have uninitialised Kalman/ATR/VR.\n"
+              "  Results will NOT match TradingView for this period.\n")
+
+    # ── 7. Run backtest ───────────────────────────────────────
     engine.run(bars)
 
     if not engine.trades:
         print("\nNo trades generated. Check strategy parameters in config.py.\n")
         sys.exit(0)
 
-    # ── 4. Report ─────────────────────────────────────────────
+    # ── 8. Report ─────────────────────────────────────────────
     metrics = compute_metrics(engine.trades, engine._equity)
-    print_report(metrics, bars, args.slip, args.comm)
+    print_report(metrics, bars, len(warmup_bars), args.slip, args.comm)
 
-    # ── 5. Save outputs ───────────────────────────────────────
+    # ── 9. Save outputs ───────────────────────────────────────
     print("  Output files:")
     save_trade_log(
         engine.trades,
