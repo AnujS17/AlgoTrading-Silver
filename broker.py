@@ -217,7 +217,7 @@ class UpstoxBroker:
             "quantity":          quantity,
             "product":           config.PRODUCT_TYPE,
             "validity":          "DAY",
-            "price":             round(price, 1) if order_type == "LIMIT" else 0,
+            "price":             int(round(price)) if order_type == "LIMIT" else 0,
             "tag":               (tag or f"KLM_{uuid.uuid4().hex[:6].upper()}")[:20],
             "instrument_token":  config.INSTRUMENT_KEY,
             "order_type":        order_type,
@@ -281,7 +281,7 @@ class UpstoxBroker:
             trigger_price    : the price level at which stop fires
             tag              : label shown in Upstox order book
         """
-        trigger_price = round(trigger_price, 1)
+        trigger_price = int(round(trigger_price))
         payload = {
             "quantity":          quantity,
             "product":           config.PRODUCT_TYPE,
